@@ -35,6 +35,7 @@
 #   ./start.sh stop               stop both nodes
 #   ./start.sh restart            stop + start
 #   ./start.sh status             containers + API health
+#   ./start.sh moex-check         read-only config/JIT-artifact checks (not GPU qualification)
 #   ./start.sh logs               follow head logs
 #   ./start.sh logs worker        follow worker container logs
 #
@@ -70,6 +71,8 @@ _cli_max_num_seqs="${MAX_NUM_SEQS-}"
 _cli_max_model_len="${MAX_MODEL_LEN-}"
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
+_cli_moex_set="${DSV41_EXL3_MOE_X+1}"
+_cli_moex="${DSV41_EXL3_MOE_X-}"
 _cli_dspark="${DSPARK_TOKENS-}"
 set -a
 # shellcheck disable=SC1091
@@ -91,6 +94,7 @@ set +a
 [ -n "${_cli_max_num_seqs}" ] && MAX_NUM_SEQS="$_cli_max_num_seqs"
 [ -n "${_cli_max_model_len}" ] && MAX_MODEL_LEN="$_cli_max_model_len"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
+[ -n "${_cli_moex_set}" ] && DSV41_EXL3_MOE_X="$_cli_moex"
 [ -n "${_cli_dspark}" ] && DSPARK_TOKENS="$_cli_dspark"
 
 # ----------------------------- configuration -------------------------------
@@ -293,6 +297,8 @@ WEIGHT_BUDGET_HOST="${WEIGHT_BUDGET_HOST:-$SCRIPT_DIR/scripts/weight_budget.py}"
 HEAD_PACKED_DIR="${HEAD_PACKED_DIR:-$HOME/dsv41-engram}"
 WORKER_PACKED_DIR="${WORKER_PACKED_DIR:-$WORKER_HOME/dsv41-engram}"
 PACKED_MOUNT="${PACKED_MOUNT:-/engram-packed}"
+HEAD_MOEX_DIR="${HEAD_MOEX_DIR:-}"
+WORKER_MOEX_DIR="${WORKER_MOEX_DIR:-}"
 
 LOGDIR="$SCRIPT_DIR/logs"
 HEAD_SCRIPT="$SCRIPT_DIR/.dsv41-exl3-head.inner.sh"
@@ -369,6 +375,21 @@ _dsv41_validate_prefix_retention() {
     export PREFIX_CACHE_RETENTION_INTERVAL
 }
 
+_dsv41_validate_moex() {
+    local raw="${DSV41_EXL3_MOE_X-}" shape groups width
+    [ -z "$raw" ] && return 0
+    case "$raw" in 1|2) return 0 ;; esac
+    if ! [[ "$raw" =~ ^([12]),([1-9][0-9]?),([1-9][0-9]?)$ ]]; then
+        echo "DSV41_EXL3_MOE_X must be empty, 1/2, or shape,groups,group_size (shape 1/2; groups and group_size 1..64)" >&2
+        return 2
+    fi
+    IFS=, read -r shape groups width <<< "$raw"
+    if (( groups > 64 || width > 64 )); then
+        echo "DSV41_EXL3_MOE_X groups and group_size must be 1..64" >&2
+        return 2
+    fi
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -382,6 +403,7 @@ validate_numeric_config() {
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
     _dsv41_validate_prefix_retention || return
+    _dsv41_validate_moex || return
 }
 # GLM53 numeric config guard (end)
 
@@ -395,6 +417,35 @@ banner() {
 }
 
 worker_ssh() { ssh -T -o BatchMode=yes -o ConnectTimeout=15 "$WORKER_SSH" "$@"; }
+
+# MoE-X artifact guard (begin)
+moex_preflight() {
+    [ -n "${DSV41_EXL3_MOE_X-}" ] || return 0
+    # Both empty selects extensions already built into the serving images.
+    [ -n "$HEAD_MOEX_DIR$WORKER_MOEX_DIR" ] || return 0
+    local path head_id worker_id kernel_hash head_abi worker_abi
+    for path in "$HEAD_MOEX_DIR" "$WORKER_MOEX_DIR"; do
+        if ! [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+            die "MoE-X requires BOTH absolute artifact paths without shell metacharacters: head=$HEAD_MOEX_DIR worker=$WORKER_MOEX_DIR"
+        fi
+    done
+    head_id=$(docker image inspect "$IMAGE" --format '{{.Id}}') || return
+    worker_id=$(worker_ssh "docker image inspect '$IMAGE' --format '{{.Id}}'") || return
+    kernel_hash=$(python3 - "$SCRIPT_DIR/overlay/moex" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+print(hashlib.sha256((p / 'exl3_moe_x.cu').read_bytes() + (p / 'exl3_moe_x.cuh').read_bytes()).hexdigest())
+PY
+    ) || return
+    local checker="$SCRIPT_DIR/overlay/moex/artifact.py"
+    head_abi=$(python3 "$checker" "$HEAD_MOEX_DIR" "$head_id" "$kernel_hash") || \
+        die "MoE-X head artifact failed: head=$HEAD_MOEX_DIR worker=$WORKER_MOEX_DIR"
+    worker_abi=$(worker_ssh "python3 - '$WORKER_MOEX_DIR' '$worker_id' '$kernel_hash'" < "$checker") || \
+        die "MoE-X worker artifact failed: head=$HEAD_MOEX_DIR worker=$WORKER_MOEX_DIR"
+    [ "$head_abi" = "$worker_abi" ] || die "MoE-X ABI/source disagreement: head=$HEAD_MOEX_DIR worker=$WORKER_MOEX_DIR"
+    log "MoE-X artifacts verified on BOTH ranks: head=$HEAD_MOEX_DIR worker=$WORKER_MOEX_DIR compatibility=$head_abi"
+}
+# MoE-X artifact guard (end)
 
 # shellcheck source=scripts/zfs-share.sh
 source "$SCRIPT_DIR/scripts/zfs-share.sh"
@@ -1418,7 +1469,7 @@ launch_cluster() {
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE \
              EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL \
              EXL3_FAT_GROUPED MODEL_DIR ENGRAM_MOUNT EXTRA_ARGS \
-             DSV41_CACHE_GIB DSV41_RESIDENT_SCALES DSV41_IO_THREADS \
+             DSV41_CACHE_GIB DSV41_RESIDENT_SCALES DSV41_IO_THREADS DSV41_EXL3_MOE_X \
              DSV41_CACHE_WAYS DSV41_STATS_SECONDS KV_CACHE_MEMORY_BYTES KV_BLOCK_SIZE \
              DSV41_SKIP_MIXED_WARMUP DSV41_DROP_PAGE_CACHE \
              DSV41_PREFILL_EMPTY_CACHE_MEMAVAIL_GIB DSV41_PREFILL_END_EMPTY_CACHE VLLM_SPARSE_INDEXER_MAX_LOGITS_MB \
@@ -1441,6 +1492,14 @@ launch_cluster() {
         log "no TP=${TP} packed Engram at $HEAD_PACKED_DIR (optional ./start.sh pack)"
     fi
 
+    # Recheck after image preparation as well as before restart's stop action.
+    moex_preflight
+    local -a head_moex_args=()
+    local worker_moex_args=""
+    if [ -n "${DSV41_EXL3_MOE_X-}" ] && [ -n "$HEAD_MOEX_DIR" ]; then
+        head_moex_args=(-v "$HEAD_MOEX_DIR:/opt/dsv41/moex:ro")
+        worker_moex_args="-v '$WORKER_MOEX_DIR:/opt/dsv41/moex:ro'"
+    fi
     log "starting worker on ${WORKER_SSH} (NCCL if=${WORKER_CX7_IF} hca=${WORKER_CX7_IB}) ..."
     worker_ssh "docker run -d --name '$CONTAINER_WORKER' \
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
@@ -1478,11 +1537,13 @@ launch_cluster() {
         -e NCCL_IB_HCA='$WORKER_CX7_IB' \
         -e NCCL_IB_GID_INDEX='$WORKER_GID' \
         -e VLLM_HOST_IP='$WORKER_IP' \
+        ${worker_moex_args} \
         ${serve_env} \
         --entrypoint bash '$IMAGE' /start.sh" >/dev/null
 
     log "starting head (vLLM API :${PORT}; NCCL if=${HEAD_CX7_IF} hca=${HEAD_CX7_IB}) ..."
     docker run -d --name "$CONTAINER_HEAD" \
+        "${head_moex_args[@]}" \
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
         --oom-score-adj 1000 --cap-add SYS_PTRACE \
         --device /dev/infiniband --cap-add IPC_LOCK \
@@ -1546,6 +1607,7 @@ launch_cluster() {
         -e ENGRAM_MOUNT="$ENGRAM_MOUNT" \
         -e DSV41_SOURCE="$ENGRAM_MOUNT" \
         -e DSV41_CACHE_GIB="$DSV41_CACHE_GIB" \
+        -e DSV41_EXL3_MOE_X="${DSV41_EXL3_MOE_X:-}" \
         -e DSV41_RESIDENT_SCALES="$DSV41_RESIDENT_SCALES" \
         -e DSV41_IO_THREADS="$DSV41_IO_THREADS" \
         -e DSV41_CACHE_WAYS="$DSV41_CACHE_WAYS" \
@@ -1786,7 +1848,8 @@ start() {
 main() {
     local cmd="${1:-start}"
     case "$cmd" in
-        start|restart) validate_numeric_config ;;
+        start|restart) validate_numeric_config; moex_preflight ;;
+        moex-check) validate_numeric_config; moex_preflight ;;
     esac
     case "$cmd" in
         stop)     banner stop.sh ;;
@@ -1801,6 +1864,7 @@ main() {
         stop)     stop ;;
         restart)  stop; start ;;
         status)   status ;;
+        moex-check) log "MoE-X configuration and configured JIT artifacts checked; GPU qualification is separate" ;;
         logs)     shift || true; logs "$@" ;;
         -h|--help|help) usage ;;
         *) usage; exit 1 ;;

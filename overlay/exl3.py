@@ -1463,6 +1463,8 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     import exllamav3_ext
 
     device = layer.w13_trellis.device
+    # Fail before pointer/scratch allocation, never for the first time in capture.
+    moex_validate_device(device)
     n_exp = len(inners)
     hidden = int(layer._exl3_hidden_size)
     intermediate = int(layer._exl3_intermediate_local)
@@ -1489,6 +1491,8 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     concurrency = int(exllamav3_ext.exl3_moe_max_concurrency(idx))
     if concurrency < 1:
         concurrency = 1
+    # exl3_moe_x (GB10 pipeline shape, see moex_config()): temps hold one slot per launched group
+    concurrency = max(concurrency, moex_config()[1])
     rows = temp_rows_fused()
     key = (str(device), hidden, intermediate, concurrency, rows)
     temps = _FUSED_TEMP_CACHE.get(key)
@@ -1507,6 +1511,8 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     )
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
+    if moex_config()[0] >= 0:
+        moex_locks(device)  # allocated here, never inside CUDA-graph capture
     gate0, up0, down0 = inners[0]["gate"], inners[0]["up"], inners[0]["down"]
     layer._exl3_k = int(gate0.K)
     layer._exl3_k_gate = int(gate0.K)
@@ -1514,6 +1520,78 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_k_down = int(down0.K)
     layer._exl3_mcg = bool(gate0.mcg)
     layer._exl3_mul1 = bool(gate0.mul1)
+
+
+# --- exl3_moe_x: the GB10-shaped exl3_moe (overlay/moex/) -----------------------------------
+# DSV41_EXL3_MOE_X="<shape>[,<groups>,<group_size>]" routes every fused MoE launch through
+# exl3_moe_x_ext, built into the image by overlay/moex/build_moe_x.py (or loaded from
+# DSV41_EXL3_MOE_X_DIR). Same kernel body and inner GEMM as exllamav3's exl3_moe; only the
+# cp.async depth, fragment stages, blocks per SM and group grid differ. Shape 2 = 32-K tile,
+# 6 stages, 2 fragment stages, 2 blocks per SM. Cross-expert fp32 scatter ordering can
+# change numerical results. Thin experts in prefill also use this path; larger experts
+# stay on the grouped path. Compile-time K = 2/3/4. Unset/empty = shipped kernel.
+_MOEX = {"cfg": None, "mod": None, "locks": {}, "validated": set()}
+
+
+def moex_config() -> tuple[int, int, int]:
+    """(shape, groups, group_size); shape -1 = off."""
+    if _MOEX["cfg"] is None:
+        raw = os.environ.get("DSV41_EXL3_MOE_X", "")
+        if not raw:
+            _MOEX["cfg"] = (-1, 0, 8)
+        else:
+            fields = raw.split(",")
+            # Bound length before int conversion; reject whitespace, signs, leading
+            # zeroes and trailing fields identically to the shell pre-stop guard.
+            if (len(fields) not in (1, 3) or fields[0] not in ("1", "2")
+                    or any(not (1 <= len(p) <= 2 and p.isascii() and p.isdigit()
+                                and p[0] != "0" and int(p) <= 64) for p in fields[1:])):
+                raise ValueError("DSV41_EXL3_MOE_X must be empty, 1/2, or shape,groups,group_size (shape 1/2; groups and group_size 1..64)")
+            _MOEX["cfg"] = (int(fields[0]), 12, 8) if len(fields) == 1 else tuple(map(int, fields))
+    return _MOEX["cfg"]
+
+
+def moex_module():
+    if _MOEX["mod"] is None:
+        # Prefer the verified bind-mounted artifact over a possibly older module
+        # installed in site-packages. With no artifact here the in-image import
+        # still works normally.
+        d = os.environ.get("DSV41_EXL3_MOE_X_DIR", "/opt/dsv41/moex")
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        try:
+            import exl3_moe_x_ext
+        except ImportError as exc:
+            raise RuntimeError(f"MoE-X requested but extension cannot be loaded from {d} or image; verify BOTH node artifacts before launch") from exc
+        _MOEX["mod"] = exl3_moe_x_ext
+    return _MOEX["mod"]
+
+
+def moex_validate_device(device: torch.device) -> None:
+    shape, groups, width = moex_config()
+    if shape < 0 or str(device) in _MOEX["validated"]:
+        return
+    mod = moex_module()
+    with torch.cuda.device(device):
+        for k in (2, 3, 4):
+            vi = int(mod.moex_variant_index(shape, k))
+            if vi < 0:
+                raise RuntimeError(f"MoE-X has no instance for shape={shape}, K={k}")
+            info = list(mod.moex_info(vi))
+            if info[2] <= 0 or info[4] <= 0 or groups * width > info[2] * info[4]:
+                raise RuntimeError(f"MoE-X grid {groups}x{width} cannot be co-resident on {device}, K={k}: {info}")
+            logger.info("exl3_moe_x engaged: device=%s shape=%s K=%s instance=%s groups=%s group_size=%s properties=%s",
+                        device, shape, k, mod.moex_name(vi), groups, width, info)
+    _MOEX["validated"].add(str(device))
+
+
+def moex_locks(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    buf = _MOEX["locks"].get(key)
+    if buf is None:
+        mod = moex_module()
+        buf = _MOEX["locks"][key] = torch.zeros(int(mod.moex_locks_ints()) + 4096, dtype=torch.int32, device=device)
+    return buf
 
 
 def _exl3_moe_launch(
@@ -1562,6 +1640,10 @@ def _exl3_moe_launch(
         bool(down.mul1),
         float(limit),
     )
+    shape, groups, gsize = moex_config()
+    if shape >= 0:
+        moex_module().exl3_moe_x(*args, moex_locks(xh.device), shape, groups, gsize)
+        return
     if n_active_host is not None:
         fn(*args, n_active_host)
     else:
@@ -2719,4 +2801,3 @@ class Exl3LinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
         return out
-
